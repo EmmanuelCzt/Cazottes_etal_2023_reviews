@@ -1,0 +1,424 @@
+##Snakemake Workflow for SNP calling from DNA-Seq
+#Snakemake workflow for the GATK Germline Short variant discovery pipeline : https://gatk.broadinstitute.org/hc/en-us/articles/360035535932-Germline-short-variant-discovery-SNPs-Indels
+
+configfile: "config.yaml"
+
+INDIR=config["INDIR"]
+WORKDIR=config["WORKDIR"]
+ref_fa=config["REFTARGET"]
+dbsnp=config["DBSNP"]
+
+rule all:
+    input:
+        vcf=expand(WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.exonicSNPs.vcf", sample=config["SAMPLES"]),
+        index=expand(WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.exonicSNPs.vcf.idx", sample=config["SAMPLES"]),
+        #tab=expand(WORKDIR+"/table/{sample}.annotated.HardFiltered.SNPs.HET.tab", sample=config["SAMPLES"])
+        #fastqc=expand(WORKDIR+"/fastqc/{sample}.rheMac10.fastqc.html", sample=config["SAMPLES"], cellLine=config["CELLS"], targetGenome=config["REFERENCE"]),
+        #bam=expand(WORKDIR+"/bam/XenoFilteR/{sample}/Filtered_bams/{sample}_Filtered.bam", sample=config["SAMPLES"]),
+        #bai=expand(WORKDIR+"/bam/XenoFilteR/{sample}/Filtered_bams/{sample}_Filtered.bam.bai", sample=config["SAMPLES"])
+       #vcf=expand(WORKDIR+"/vcf/{sample}.annotated.vcf", sample=config["SAMPLES"]),
+       #vcf_idx=expand(WORKDIR+"/vcf/{sample}.annotated.vcf.idx", sample=config["SAMPLES"])
+
+rule fastqc:
+    #priority:3
+    input:
+        fastq1=WORKDIR+"/fastq/{sample}.trimmed.R1.fastq.gz",
+        fastq2=WORKDIR+"/fastq/{sample}.trimmed.R2.fastq.gz",
+    output: 
+        fastqc=WORKDIR+"/fastqc/{sample}.rheMac10.fastqc.html"
+    params:
+        outfolder=WORKDIR+"/fastqc/"
+    log:
+        out="logs/FASTQC.{sample}.rheMac10.out",
+        err="logs/FASTQC.{sample}.rheMac10.err"
+    shell:
+        "fastqc -o {params.outfolder} {input.fastq1} {input.fastq2} 1> {log.out} 2> {log.err}"
+
+###################################Pre-processing#####################################
+
+rule CatnSortBams:
+    input:
+        slice1=INDIR+"/{sample}_1/Filtered_bams/{sample}_1_Filtered.bam",
+        slice2=INDIR+"/{sample}_2/Filtered_bams/{sample}_2_Filtered.bam",
+        slice3=INDIR+"/{sample}_3/Filtered_bams/{sample}_3_Filtered.bam",
+        slice4=INDIR+"/{sample}_4/Filtered_bams/{sample}_4_Filtered.bam",
+        slice5=INDIR+"/{sample}_5/Filtered_bams/{sample}_5_Filtered.bam"
+    output:
+        bam=WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.bam"
+    threads: 6
+    shell:
+        "samtools cat -@ {threads} {input.slice1} {input.slice2} {input.slice3} \
+        {input.slice4} {input.slice5} | samtools sort -@ {threads} -O bam -o {output.bam} -"
+
+rule CSBIndex:
+    input:
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.bam"
+    output:
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.bam.bai"
+    params:
+        "" # optional params string
+    threads: 6
+    log: "log/{sample}_samtools_index_csb.log"
+    shell:
+        "samtools index -b -@ {threads} {input} 2> {log}"
+
+rule MarkDuplicates:
+    input: 
+        bam=WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.bam",
+        bai=WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.bam.bai"
+    output: 
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.bam"
+    params:
+            CREATE_INDEX="true",
+            VALIDATION_STRINGENCY="SILENT",
+            REMOVE_DUPLICATES="true",
+            ASSUME_SORTED="true",
+            M="output.metrics"
+    log:
+        "log/{sample}_MarkDuplicates.log"
+    shell:
+        "(picard MarkDuplicates \
+            I={input.bam} \
+            O={output} \
+            CREATE_INDEX={params.CREATE_INDEX} \
+            VALIDATION_STRINGENCY={params.VALIDATION_STRINGENCY} \
+            REMOVE_DUPLICATES={params.REMOVE_DUPLICATES} \
+            ASSUME_SORTED={params.ASSUME_SORTED} \
+            M={params.M}) 2> {log}"
+
+rule MDIndex:
+    input:
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.bam"
+    output:
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.bam.bai"
+    params:
+        "" # optional params string
+    threads: 6
+    log: "log/{sample}_samtools_index_md.log"
+    shell:"""
+    samtools index -b -@ {threads} {input} 2> {log}
+    """
+
+rule AddOrReplaceReadGroups:
+    input:
+        bam=WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.bam",
+        bai=WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.bam.bai"
+    output: 
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.rg.added.bam"
+    params:
+        SO="coordinate",
+        RGID="{sample}",
+        RGLB="library",
+        RGPL="platform",
+        RGPU="machine",
+        RGSM="RG:Z:{sample}"
+    #priority: 5
+    log:
+        "logs/{sample}_AddOrReplaceReadGroups.log"
+    shell:
+        "(picard  AddOrReplaceReadGroups \
+            I={input.bam} \
+            O={output} \
+            SO={params.SO} \
+            RGID={params.RGID} \
+            RGLB={params.RGLB} \
+            RGPL={params.RGPL} \
+            RGPU={params.RGPU} \
+            RGSM={params.RGSM}) 2> {log}"
+
+rule samtools_index_csi:
+    input: 
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.rg.added.bam"
+    output: 
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.rg.added.bam.csi"
+    params:
+        "" # optional params string
+    #priority: 7
+    shell:
+        "(samtools index -c {input})"
+
+rule samtools_index_bai:
+    input: 
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.rg.added.bam"
+    output:
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.rg.added.bam.bai"
+    params:
+        "" # optional params string
+    #priority: 8
+    shell:
+        "(samtools index {input})"
+
+rule BaseRecalibrator:
+    input:
+        bam=WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.rg.added.bam"
+    output: 
+        WORKDIR+"/GATKpreProcess/{sample}.recal.table"
+    params:
+        ref=ref_fa,
+        #knownIndels="/shared/projects/xci/ReferenceGenomes/GRCh38/variant/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz",
+        dbsnp=dbsnp
+    log:
+        "logs/{sample}_BaseRecalibrator.log"
+    shell:
+        "(gatk BaseRecalibrator -I {input.bam} \
+            -R {params.ref} \
+            --known-sites {params.dbsnp} \
+            -O {output}) 2> {log}"
+
+# BaseRecalibrator requires .tbi file for ref SNP/indels
+# samtools bgzip
+#bcftools index -t vcf.gz
+
+rule ApplyBQSR:
+    input:
+        bam=WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.rg.added.bam",
+        bqsr=WORKDIR+"/GATKpreProcess/{sample}.recal.table"
+    output:
+        WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.rg.added.recal.bam"
+    params:
+        ref=ref_fa,
+    log:
+        "logs/{sample}_ApplyBQSR.log"
+    shell:
+        "(gatk ApplyBQSR \
+            -R {params.ref} \
+            -I {input.bam} \
+            -bqsr {input.bqsr} \
+            -O {output}) 2> {log}"
+
+###################################SNP Calling#####################################
+
+rule HaplotypeCaller:
+    input:
+        bam=WORKDIR+"/GATKpreProcess/{sample}.q10.xenoFiltR.cat.sorted.dedupped.rg.added.recal.bam"
+    params:
+        ref=ref_fa,
+        stand_call_conf=10.0,
+    output: 
+        vcf=WORKDIR+"/vcf/haploCaller/{sample}.vcf",
+        index=WORKDIR+"/vcf/haploCaller/{sample}.vcf.idx"
+    threads: 16
+    log:
+        "logs/{sample}_HaplotypeCaller.log"
+    shell:
+        "(gatk HaplotypeCaller \
+            -R {params.ref} \
+            -I {input.bam} \
+            --create-output-variant-index \
+            --dont-use-soft-clipped-bases \
+            --native-pair-hmm-threads {threads} \
+            -stand-call-conf {params.stand_call_conf} \
+            -O {output.vcf}) 2> {log}"
+
+rule SelectSNPs:
+    input:
+        vcf=WORKDIR+"/vcf/haploCaller/{sample}.vcf"
+    output:
+        WORKDIR+"/vcf/haploCaller/{sample}.SNPs.vcf"
+    log:
+        "logs/{sample}_selectSNPs.logs"
+    shell:
+        "gatk SelectVariants -V {input.vcf} -select-type SNP -O {output} 2> {log}"
+
+##soft-clipped: bases in 5' and 3' of the read are NOT part of the alignment.
+
+##hard-clipped: bases in 5' and 3' of the read are NOT part of the alignment AND those bases have been removed from the read sequence in the BAM file. The 'real' sequence length would be length(SEQ)+ count-of-hard-clipped-bases
+
+
+rule IndexFeatureFile:
+    input: WORKDIR+"/vcf/haploCaller/{sample}.SNPs.vcf"
+    output: WORKDIR+"/vcf/haploCaller/{sample}.SNPs.vcf.idx"
+    priority: 10
+    log: "logs/{sample}_indexfeature.log"
+    shell:
+        "(gatk IndexFeatureFile \
+            -I {input}) 2> {log}"
+
+rule VariantAnnotator:
+    input:
+        vcf=WORKDIR+"/vcf/haploCaller/{sample}.SNPs.vcf",
+        idx=WORKDIR+"/vcf/haploCaller/{sample}.SNPs.vcf.idx"
+    params:
+        dbsnp=dbsnp,
+        ref=ref_fa
+    output:
+        WORKDIR+"/vcf/annotated/annotated.{sample}.vcf"
+    log:
+        "logs/{sample}_vcf_annot.log"
+    priority: 9
+    shell:
+        "(gatk VariantAnnotator -R {params.ref} -V {input.vcf} \
+        -O {output} --dbsnp {params.dbsnp}) 2> {log}"
+
+rule Index_Annotation:
+    input: WORKDIR+"/vcf/annotated/annotated.{sample}.vcf"
+    output: WORKDIR+"/vcf/annotated/annotated.{sample}.vcf.idx"
+    log: "logs/{sample}_indexfeature_annot.log"
+    priority: 8
+    shell:
+        "(gatk IndexFeatureFile \
+            -I {input}) 2> {log}"
+
+rule VariantFiltration:
+    input:
+        vcf=WORKDIR+"/vcf/annotated/annotated.{sample}.vcf",
+        index=WORKDIR+"/vcf/annotated/annotated.{sample}.vcf.idx"
+    output:
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.vcf"
+    params:
+        ref=ref_fa
+    log:
+        "logs/{sample}_VariantFiltration.log"
+    shell:
+        "(gatk VariantFiltration \
+        -R {params.ref} \
+        -V {input.vcf} \
+        -window 50 \
+        -cluster 3 \
+        --filter-name 'FS' \
+        -filter 'FS > 60.0' \
+        --filter-name 'QD' \
+        -filter 'QD < 6.0' \
+        --filter-name 'SOR' \
+        -filter 'SOR > 3.0' \
+        --filter-name 'MQ' \
+        -filter 'MQ < 50.0' \
+        --filter-name 'MQRankSum' \
+        -filter 'MQRankSum < -12.5' \
+        --filter-name 'MQPosRankSum' \
+        -filter 'MQPosRankSum < -8.0' \
+        --filter-name 'DP' \
+        -filter 'DP < 10' \
+        -O {output}) 2> {log}"
+
+rule bgzip:
+    input: 
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.vcf"
+    output:
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.vcf.gz"
+    log:
+        "logs/{sample}_bgzip.log"
+    shell:
+        "(bgzip {input}) 2> {log}"
+
+
+rule bcfFiltering:
+    input:
+        vcf=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.vcf.gz"
+    output:
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf"
+    params:
+        view="snps",
+        genot="het",
+        filt="PASS"
+    log:
+        "logs/{sample}_bcfFiltering.log"
+    shell:
+        "(bcftools view -v {params.view} \
+        -g {params.genot} \
+        -f {params.filt} -O v -o {output} {input.vcf}) 2> {log}"
+
+rule Index_HF:
+    input: WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf"
+    output: WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf.idx"
+    log: "logs/{sample}_indexHF_annot.log"
+    priority: 8
+    shell:
+        "(gatk IndexFeatureFile \
+            -I {input}) 2> {log}"
+
+rule VariantsToTable:
+    input: 
+        vcf=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf",
+        idx=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf.idx"
+    output:
+        tab=WORKDIR+"/table/{sample}.annotated.HardFiltered.SNPs.HET.tab"
+    params:
+        table_arg="argt_table"
+    log:
+        "logs/{sample}_VariantsTotable.log"
+    shell:
+        "(gatk VariantsToTable -V {input.vcf} --arguments_file {params.table_arg} -O {output.tab}) \
+        2> {log}"
+
+#Most called SNPs have a 0.5 allelic ratio yet some display a skewed ratio which is odd since the calling is made from a pure population of a unique sample
+#The solution is to compute the allelic ratio to get the SNPs with AR<0.3 or AR>0.7 and filter them out
+
+rule GetSkewedSNPs:
+    input:
+        tab=WORKDIR+"/table/{sample}.annotated.HardFiltered.SNPs.HET.tab"
+    output:
+        WORKDIR+"/bed/{sample}.SkewedSNPs.bed"
+    log:
+        "logs/{sample}.skewed.bed.log"
+    shell:
+        "Rscript script/allelicRatio.R {input.tab} {output} 2> {log}"
+
+rule bgzip_skewed:
+    input: 
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf"
+    output:
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf.gz"
+    log:
+        "logs/{sample}_bgzip_skewed.log"
+    shell:
+        "(bgzip {input}) 2> {log}"
+
+rule tabix_skewed:
+    input:
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf.gz"
+    output:
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf.gz.tbi"
+    log:
+        "logs/{sample}.tabix.log"
+
+#rule filterSkewed:
+#    input:
+#        vcf=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf.gz",
+#        idx=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf.gz.tbi",
+#        bed=WORKDIR+"/bed/{sample}.SkewedSNPs.bed"
+#    output:
+#        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.vcf"
+#    log:
+#        "logs/{sample}.balancedAR.log"
+#    shell:
+#        "bcftools view -R {input.bed} -O v -o {output} {input.vcf} 2> {log}"
+
+rule filterSkewed:
+    input:
+        vcf=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf",
+        idx=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.vcf.idx",
+        bed=WORKDIR+"/bed/{sample}.SkewedSNPs.sorted.noScaff.bed"
+    output:
+        vcf=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.vcf",
+        idx=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.vcf.idx"
+    params:
+        ref=ref_fa
+    log:
+        "logs/{sample}.balancedAR.log"
+    shell:
+        "gatk SelectVariants --create-output-variant-index -R {params.ref} -V {input.vcf} -L {input.bed} -O {output.vcf} 2> {log}"
+
+rule GetExonicSNPs:
+    input:
+        vcf=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.vcf",
+        idx=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.vcf.idx",
+        bed="/shared/projects/primate_hic/genomes/rhemac10/annotation/Macaca_mulatta.Mmul_10.108.UCSC.XICRNA.20221129.protein_coding.lncRNA.exons.noScaff.bed"
+    output:
+        vcf=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.exonicSNPs.vcf",
+        idx=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.exonicSNPs.vcf.idx"
+    params:
+        ref=ref_fa
+    log:
+        "logs/{sample}.exonicSNPs.log"
+    shell:
+        "gatk SelectVariants --create-output-variant-index -R {params.ref} -V {input.vcf} -L {input.bed} -O {output.vcf} 2> {log}"
+
+#rule Index_balanced:
+#    input: WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.vcf"
+#    output: WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.balancedAR.vcf.idx"
+#    log: "logs/{sample}_indexbalanced.log"
+#    priority: 8
+#    shell:
+#        "(gatk IndexFeatureFile \
+#            -I {input}) 2> {log}"

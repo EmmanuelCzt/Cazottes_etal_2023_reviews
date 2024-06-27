@@ -1,0 +1,112 @@
+configfile: "config.yaml"
+
+
+#Classic pipeline to go from fastq reads to gene counts using STAR
+#SAMPLES = Testing scRNAseq read to count table pipeline : ERR1041403
+
+rule all:
+    input:
+        expand("annotation/{sample}.scallop.gtf", sample=config["samples"])
+
+rule SAM_uniq:
+	input:
+		"map/{sample}_calJac4Aligned.sortedByCoord.out.bam"
+	output:
+		temp("map/{sample}_uniq.bam")
+	log:
+		"logs/SAM_uniq/{sample}.log"
+	threads: 6
+	params:
+		qual=10,
+		filtre="F1280"
+	shell:
+		"(samtools view -@ {threads} -q {params.qual} -F {params.filtre} -h -b {input} > {output}) 2> {log}"
+
+rule SAM_sort:
+	input:
+		"map/{sample}_uniq.bam"
+	output:
+		protected("map/{sample}_uniq_sorted.bam")
+	log:
+		"logs/SAM_sort/{sample}.log"
+	threads: 6
+	shell:
+		"(samtools sort -@ {threads} -o {output} {input}) 2> {log}"
+
+rule SAM_index:
+	input:
+		"map/{sample}_uniq_sorted.bam"
+	output:
+		protected("map/{sample}_uniq_sorted.bam.bai")
+	log:
+		"logs/SAM_index/{sample}.log"
+	shell:
+		"(samtools index {input}) 2> {log}"
+
+rule SAM_idxstat:
+	input:
+		bam="map/{sample}_uniq_sorted.bam"
+	output:
+		protected("stats/{sample}.stats")
+	log:
+		"logs/SAM_stats/{sample}.log"
+	shell:
+		"(samtools idxstats {input} > {output}) 2> {log}"
+
+rule bigwig_forward:
+    input:
+        bam="map/{sample}_uniq_sorted.bam",
+        idx="map/{sample}_uniq_sorted.bam.bai"
+    output: protected("bigwig/{sample}_BPM_forward.bw")
+    threads: 6
+    params:
+        filterRNAstrand="forward",
+        normalizeUsing="BPM",
+        binSize=20,
+        smoothLength=40,
+    log: "logs/{sample}_BPM_chrX_forward.bw"
+    shell:
+        "(bamCoverage -b {input.bam} --filterRNAstrand {params.filterRNAstrand} --normalizeUsing {params.normalizeUsing} --binSize {params.binSize} --smoothLength {params.smoothLength} -p {threads} -o {output}) 2> {log}"
+
+rule bigwig_reverse:
+    input:
+        bam="map/{sample}_uniq_sorted.bam",
+        fwd="bigwig/{sample}_BPM_forward.bw"
+    output: protected("bigwig/{sample}_BPM_reverse.bw")
+    threads: 8
+    params:
+        filterRNAstrand="reverse",
+        normalizeUsing="BPM",
+        binSize=20,
+        smoothLength=40,
+    log: "logs/{sample}_BPM_reverse.bw"
+    shell:
+        "(bamCoverage -b {input.bam} --filterRNAstrand {params.filterRNAstrand} \
+        --normalizeUsing {params.normalizeUsing}  --binSize {params.binSize} \
+        --smoothLength {params.smoothLength} \
+        -p {threads} -o {output}) 2> {log}"
+
+rule scallop:
+	input:
+		bam=("map/{sample}_uniq_sorted.bam"),
+		bw=("bigwig/{sample}_BPM_reverse.bw")
+	output:
+		"annotation/{sample}.scallop.gtf"
+	log:
+		"logs/scallop/{sample}.log"
+	params:
+		tx_length=200,
+		flk_length=10,
+		spl_reads=3,
+		gap=25,
+		cov=1,
+		sgl_cov=20
+	shell:
+		"(scallop -i {input.bam} \
+		--min_transcript_length_base {params.tx_length} \
+		--min_flank_length {params.flk_length} \
+		--min_splice_bundary_hits {params.spl_reads} \
+		--min_bundle_gap {params.gap} \
+		--min_transcript_coverage {params.cov} \
+		--min_single_exon_coverage {params.sgl_cov} \
+		-o {output}) 2> {log}"

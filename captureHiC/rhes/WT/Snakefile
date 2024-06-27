@@ -1,0 +1,80 @@
+configfile: "config.yaml"
+
+WORKDIR=config["WORKDIR"]
+chrom_sizes=config["CHROMSIZES"]
+
+rule all:
+	input:
+		mcooler=expand(WORKDIR+"/hic_results/mcooler/{sample}/{sample}.ontarget.{allele}.XIC.6000.mcool", sample=config["SAMPLES"], allele=config["ALLELE"])
+
+#rule multiqc:
+#	input:
+#		WORKDIR+"/hic_results/stats/{sample}/{sample}*stat"
+#	output:
+#		WORKDIR+"/hic_results/stats/{sample}/multiqc_report.html"
+#	params:
+#		outdir=WORKDIR+"/hic_results/stats/{sample}"
+#	log:
+#		"logs/multiqc_{sample}.log"
+#	shell:
+#		"(multiqc -o {params.outdir} {input}) 2> {log}"
+
+rule SelectCapture:
+	input:
+		validPairs=WORKDIR+"/hic_results/data/{sample}/{sample}_ontarget_{allele}.allValidPairs" #allele=["" "_G1" "_G2"]
+	output:
+		WORKDIR+"/hic_results/data/{sample}/{sample}_ontarget.{allele}.XIC.allValidPairs"
+	params:
+		start=69479389,
+		end=72479389,
+		qual=10,
+		chrom="chrX"
+	log:
+		"logs/SelectCapture_{sample}_{allele}.log"
+	shell:
+		"(awk -v s={params.start} -v e={params.end} -v q={params.qual} -v chr='chrX' \
+		'$2==chr && $5==chr && $3>=s && $3<=e && $6>=s && $6<=e && $10>=q && $11>=q {{print $0}}' \
+		{input.validPairs} > {output}) 2> {log}"
+
+rule HiCPro2cooler:
+	input:
+		WORKDIR+"/hic_results/data/{sample}/{sample}_ontarget.{allele}.XIC.allValidPairs"
+	output:
+		cooler=WORKDIR+"/hic_results/cooler/{sample}/6000/{sample}.ontarget.{allele}.XIC.6000.cool"
+	params:
+		script="/shared/projects/primate_hic/captureHiC/rhes/WT/scripts/allValidPairs2cooler.sh",
+		chromSizes=chrom_sizes,
+		resolution=6000
+	threads: 16
+	log:
+		"logs/HiCPro2cooler.{sample}.{allele}.6000.log"
+	shell:
+		"({params.script} -i {input} -c {params.chromSizes} -r {params.resolution} -p {threads} \
+		-o {output.cooler}) 2> {log}"
+
+rule Zoomify:
+	input:
+		WORKDIR+"/hic_results/cooler/{sample}/6000/{sample}.ontarget.{allele}.XIC.6000.cool"
+	output:
+		mcooler=WORKDIR+"/hic_results/mcooler/{sample}/{sample}.ontarget.{allele}.XIC.6000.mcool"
+	params:
+		resolution="6000N"
+	threads: 16
+	log:
+		"logs/zoomify.{sample}.{allele}.6000.log"
+	shell:
+		"(cooler zoomify -n {threads} --balance -r {params.resolution} --balance-args '--nproc {threads}' \
+		-o {output.mcooler} {input}) 2> {log}"
+
+#rule coolerShow:
+#	input:
+#		mcooler=WORKDIR+"/hic_results/mcooler/{sample}/{sample}.ontarget.{allele}.XIC.6000.mcool"
+#	output:
+#		maps_pdf=expand(WORKDIR+"/hic_results/contact_maps/{sample}/{sample}.ontarget.{allele}.XIC.{res}.pdf", res=["6000" "10000" "20000" "50000" "100000"])
+#	params:
+#		coordinates="chrX:73077515-75326610",
+#		dpi=300
+#	log:
+#		expand("logs/show.{sample}.{allele}.{res}.log", res=["6000" "10000" "20000" "50000" "100000"])
+#	shell:
+#		"cooler show -b --dpi {params.dpi} --out {output.maps_pdf} {input.mcooler}"

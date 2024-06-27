@@ -1,0 +1,408 @@
+##Snakemake Workflow for SNP calling from DNA-Seq
+#Snakemake workflow for the GATK Germline Short variant discovery pipeline : https://gatk.broadinstitute.org/hc/en-us/articles/360035535932-Germline-short-variant-discovery-SNPs-Indels
+
+configfile: "config.yaml"
+
+INDIR=config["INDIR"]
+WORKDIR=config["WORKDIR"]
+ref_fa=config["REFTARGET"]
+ref_mouse=config["REFMOUSE"]
+dbsnp=config["DBSNP"]
+
+rule all:
+    input:
+        #expand(WORKDIR+"/vcf/haploCaller/{sample}.vcf", sample=config["SAMPLES"])
+        #fastqc=expand(WORKDIR+"/fastqc/{sample}.rheMac10.fastqc.html", sample=config["SAMPLES"], cellLine=config["CELLS"], targetGenome=config["REFERENCE"]),
+        bam=expand(WORKDIR+"/bam/rheMac10/XenoFilteR/{sample}_{slice}/Filtered_bams/{sample}_{slice}_Filtered.bam", sample=config["SAMPLES"], slice=config["SLICES"]),
+        bai=expand(WORKDIR+"/bam/rheMac10/XenoFilteR/{sample}_{slice}/Filtered_bams/{sample}_{slice}_Filtered.bam.bai", sample=config["SAMPLES"], slice=config["SLICES"])
+       #vcf=expand(WORKDIR+"/vcf/{sample}.annotated.vcf", sample=config["SAMPLES"]),
+       #vcf_idx=expand(WORKDIR+"/vcf/{sample}.annotated.vcf.idx", sample=config["SAMPLES"])
+
+rule fastqc:
+    #priority:3
+    input:
+        fastq1=WORKDIR+"/fastq/{sample}.trimmed.R1.fastq.gz",
+        fastq2=WORKDIR+"/fastq/{sample}.trimmed.R2.fastq.gz",
+    output: 
+        fastqc=WORKDIR+"/fastqc/{sample}.rheMac10.fastqc.html"
+    params:
+        outfolder=WORKDIR+"/fastqc/"
+    log:
+        out="logs/FASTQC.{sample}.rheMac10.out",
+        err="logs/FASTQC.{sample}.rheMac10.err"
+    shell:
+        "fastqc -o {params.outfolder} {input.fastq1} {input.fastq2} 1> {log.out} 2> {log.err}"
+
+###################################Align reads onto target reference genome#####################################
+
+rule bwa:
+    input:
+        fastq1=INDIR+"/{sample}.trimmed.R1.part_00{slice}.fastq.gz",
+        fastq2=INDIR+"/{sample}.trimmed.R2.part_00{slice}.fastq.gz",
+    output: 
+        bwa=WORKDIR+"/bam/rheMac10/{sample}.sortedByCoord.{slice}.bam"
+    params:
+        bases=100000000,
+        verb=3,
+        ref_fasta=ref_fa
+    threads: 8
+    log:
+        "logs/bwa.{sample}.{slice}.rheMac10.log"
+    shell:
+        "bwa mem -K {params.bases} -v {params.verb} -t {threads} -Y {params.ref_fasta} {input.fastq1} {input.fastq2} 2> {log} | \
+        samtools sort -@ {threads} -O bam -o {output.bwa} -"
+## -K : the number of bases to process regardless of the number of threads. Advertised as enhancer of reproducibility
+## -v : level of verbosity here just the message
+## -Y : use soft clipping for supplementary alignments
+
+rule q10:
+    input:
+        bam=WORKDIR+"/bam/rheMac10/{sample}.sortedByCoord.{slice}.bam"
+    output:
+        WORKDIR+"/bam/rheMac10/{sample}.sortedByCoord.{slice}.q10.bam"
+    params: qual=10
+    threads: 6
+    log:
+        "logs/{sample}.{slice}.uniq.log"
+    shell:
+        "(samtools view -@ {threads} -q {params.qual} -b {input.bam} > {output}) \
+            2> {log}"
+
+rule bwa_index:
+    input: WORKDIR+"/bam/rheMac10/{sample}.sortedByCoord.{slice}.q10.bam"
+    output: WORKDIR+"/bam/rheMac10/{sample}.sortedByCoord.{slice}.q10.bam.bai"
+    threads: 6
+    log: "logs/bwa.index.{sample}.{slice}.rheMac10.log"
+    shell:
+        "samtools index -b -@ {threads} {input} 2> {log}"
+
+
+###################################Align reads onto mus musculus reference genome#####################################
+
+rule bwa_mouse:
+    input:
+        fastq1=INDIR+"/{sample}.trimmed.R1.part_00{slice}.fastq.gz",
+        fastq2=INDIR+"/{sample}.trimmed.R2.part_00{slice}.fastq.gz",
+    output: 
+        bwaMouse=WORKDIR+"/bam/mm10/{sample}.sortedByCoord.{slice}.bam"
+    params:
+        bases=100000000,
+        verb=3,
+        ref_fasta=ref_mouse
+    threads: 8
+    log:
+        "logs/bwa.{sample}.{slice}.mouse.logs"
+    shell:
+        "bwa mem -K {params.bases} -v {params.verb} -t {threads} -Y {params.ref_fasta} {input.fastq1} {input.fastq2} 2> {log} | \
+        samtools sort -@ {threads} -O bam -o {output.bwaMouse} -"
+
+rule q10_mouse:
+    input:
+        bam=WORKDIR+"/bam/mm10/{sample}.sortedByCoord.{slice}.bam"
+    output:
+        WORKDIR+"/bam/mm10/{sample}.sortedByCoord.{slice}.q10.bam"
+    params: qual=10
+    threads: 6
+    log:
+        "logs/{sample}.{slice}.uniq.mouse.log"
+    shell:
+        "(samtools view -@ {threads} -q {params.qual} -b {input.bam} > {output}) \
+            2> {log}"
+
+rule bwa_index_mouse:
+    input: WORKDIR+"/bam/mm10/{sample}.sortedByCoord.{slice}.q10.bam"
+    output: WORKDIR+"/bam/mm10/{sample}.sortedByCoord.{slice}.q10.bam.bai"
+    threads: 6
+    log: "logs/bwa.index.{sample}.{slice}.mouse.log"
+    shell:
+        "samtools index -b -@ {threads} {input} 2> {log}"
+
+###################################XenofiltR#####################################
+
+rule Perform_Xenofilter:
+    input: 
+        mouse_bam=WORKDIR+"/bam/mm10/{sample}.sortedByCoord.{slice}.q10.bam",
+        target_bam=WORKDIR+"/bam/rheMac10/{sample}.sortedByCoord.{slice}.q10.bam",
+        mouse_bam_bai=WORKDIR+"/bam/mm10/{sample}.sortedByCoord.{slice}.q10.bam.bai",
+        target_bam_bai=WORKDIR+"/bam/rheMac10/{sample}.sortedByCoord.{slice}.q10.bam.bai"
+    output:
+        bam=WORKDIR+"/bam/rheMac10/XenoFilteR/{sample}_{slice}/Filtered_bams/{sample}_{slice}_Filtered.bam",
+        bai=WORKDIR+"/bam/rheMac10/XenoFilteR/{sample}_{slice}/Filtered_bams/{sample}_{slice}_Filtered.bam.bai"
+    params:
+        outname="{sample}_{slice}",
+        NM=5 #Number of mismatches depending on read length: here reads = 100 bp, for reads = 75bp : NM=4 and for reads=150 bp NM=8
+    log:"logs/{sample}.{slice}_xenofilter.log"
+    shell:
+        "(Rscript Xeno.R {input.target_bam} {input.mouse_bam} {params.outname} {params.NM}) 2> {log}"
+
+###################################Pre-processing#####################################
+
+rule MarkDuplicates:
+    input: 
+        bam=WORKDIR+"/bam/XenoFilteR/{sample}/Filtered_bams/{sample}_Filtered.bam",
+        bai=WORKDIR+"/bam/XenoFilteR/{sample}/Filtered_bams/{sample}_Filtered.bam.bai"
+    output: 
+        WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.bam"
+    params:
+            CREATE_INDEX="true",
+            VALIDATION_STRINGENCY="SILENT",
+            REMOVE_DUPLICATES="true",
+            ASSUME_SORTED="true",
+            M="output.metrics"
+    log:
+        "log/{sample}_MarkDuplicates.log"
+    shell:
+        "(picard MarkDuplicates \
+            I={input.bam} \
+            O={output} \
+            CREATE_INDEX={params.CREATE_INDEX} \
+            VALIDATION_STRINGENCY={params.VALIDATION_STRINGENCY} \
+            REMOVE_DUPLICATES={params.REMOVE_DUPLICATES} \
+            ASSUME_SORTED={params.ASSUME_SORTED} \
+            M={params.M}) 2> {log}"
+
+rule MDIndex:
+    input:
+        WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.bam"
+    output:
+        WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.bam.bai"
+    params:
+        "" # optional params string
+    threads: 6
+    log: "log/{sample}_samtools_index_md.log"
+    shell:"""
+    samtools index -b -@ {threads} {input} 2> {log}
+    """
+
+rule AddOrReplaceReadGroups:
+    input:
+        bam=WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.bam",
+        bai=WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.bam.bai"
+    output: 
+        WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.rg.added.bam"
+    params:
+        SO="coordinate",
+        RGID="{sample}",
+        RGLB="library",
+        RGPL="platform",
+        RGPU="machine",
+        RGSM="RG:Z:{sample}"
+    #priority: 5
+    log:
+        "logs/{sample}_AddOrReplaceReadGroups.log"
+    shell:
+        "(picard  AddOrReplaceReadGroups \
+            I={input.bam} \
+            O={output} \
+            SO={params.SO} \
+            RGID={params.RGID} \
+            RGLB={params.RGLB} \
+            RGPL={params.RGPL} \
+            RGPU={params.RGPU} \
+            RGSM={params.RGSM}) 2> {log}"
+
+rule samtools_index_csi:
+    input: 
+        WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.rg.added.bam"
+    output: 
+        WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.rg.added.bam.csi"
+    params:
+        "" # optional params string
+    #priority: 7
+    shell:
+        "(samtools index -c {input})"
+
+rule samtools_index_bai:
+    input: 
+        WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.rg.added.bam"
+    output:
+        WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.rg.added.bam.bai"
+    params:
+        "" # optional params string
+    #priority: 8
+    shell:
+        "(samtools index {input})"
+
+rule BaseRecalibrator:
+    input:
+        bam=WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.rg.added.bam"
+    output: 
+        WORKDIR+"/bam/GATKpreProcess/{sample}.recal.table"
+    params:
+        ref=ref_fa,
+        #knownIndels="/shared/projects/xci/ReferenceGenomes/GRCh38/variant/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz",
+        dbsnp=dbsnp
+    log:
+        "logs/{sample}_BaseRecalibrator.log"
+    shell:
+        "(gatk BaseRecalibrator -I {input.bam} \
+            -R {params.ref} \
+            --known-sites {params.dbsnp} \
+            -O {output}) 2> {log}"
+
+# BaseRecalibrator requires .tbi file for ref SNP/indels
+# samtools bgzip
+#bcftools index -t vcf.gz
+
+rule ApplyBQSR:
+    input:
+        bam=WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.rg.added.bam",
+        bqsr=WORKDIR+"/bam/GATKpreProcess/{sample}.recal.table"
+    output:
+        WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.rg.added.recal.bam"
+    params:
+        ref=ref_fa,
+    log:
+        "logs/{sample}_ApplyBQSR.log"
+    shell:
+        "(gatk ApplyBQSR \
+            -R {params.ref} \
+            -I {input.bam} \
+            -bqsr {input.bqsr} \
+            -O {output}) 2> {log}"
+
+###################################SNP Calling#####################################
+
+rule HaplotypeCaller:
+    input:
+        bam=WORKDIR+"/bam/GATKpreProcess/{sample}.sorted.q10.dedupped.rg.added.bam"
+    params:
+        ref=ref_fa,
+        stand_call_conf=10.0,
+        refConf="BP_RESOLUTION",
+        maxAlt=3 #Number of alternate alleles = 3, here it makes little sense since it should be 1 but it could be interesting as a quality control
+    output: 
+        WORKDIR+"/vcf/haploCaller/{sample}.vcf"
+    log:
+        "logs/{sample}_HaplotypeCaller.log"
+    shell:
+        "(gatk HaplotypeCaller \
+            -R {params.ref} \
+            -I {input.bam} \
+            -ERC {params.refConf} \
+            --max-alternate-alleles {params.maxAlt} \
+            --create-output-variant-index \
+            --dont-use-soft-clipped-bases \
+            -stand-call-conf {params.stand_call_conf} \
+            -O {output}) 2> {log}"
+
+
+##soft-clipped: bases in 5' and 3' of the read are NOT part of the alignment.
+
+##hard-clipped: bases in 5' and 3' of the read are NOT part of the alignment AND those bases have been removed from the read sequence in the BAM file. The 'real' sequence length would be length(SEQ)+ count-of-hard-clipped-bases
+
+
+rule IndexFeatureFile:
+    input: WORKDIR+"/vcf/haploCaller/{sample}.vcf"
+    output: temp(WORKDIR+"/vcf/haploCaller/{sample}.vcf.idx")
+    priority: 10
+    log: "logs/{sample}_indexfeature.log"
+    shell:
+        "(gatk IndexFeatureFile \
+            -I {input}) 2> {log}"
+
+rule VariantAnnotator:
+    input:
+        vcf=WORKDIR+"/vcf/haploCaller/{sample}.vcf",
+        idx=WORKDIR+"/vcf/haploCaller/{sample}.vcf.idx"
+    params:
+        dbsnp=dbsnp,
+        ref=ref_fa
+    output:
+        WORKDIR+"/vcf/annotated/annotated.{sample}.vcf"
+    log:
+        "logs/{sample}_vcf_annot.log"
+    priority: 9
+    shell:
+        "(gatk VariantAnnotator -R {params.ref} -V {input.vcf} \
+        -O {output} --dbsnp {params.dbsnp}) 2> {log}"
+
+rule Index_Annotation:
+    input: WORKDIR+"/vcf/annotated/annotated.{sample}.vcf"
+    output: WORKDIR+"/vcf/annotated/annotated.{sample}.vcf.idx"
+    log: "logs/{sample}_indexfeature_annot.log"
+    priority: 8
+    shell:
+        "(gatk IndexFeatureFile \
+            -I {input}) 2> {log}"
+
+rule VariantFiltration:
+    input:
+        vcf=WORKDIR+"/vcf/annotated/annotated.{sample}.vcf",
+        index=WORKDIR+"/vcf/annotated/annotated.{sample}.vcf.idx"
+    output:
+        WORKDIR+"/vcf/{sample}.annotated.hardfiltered.vcf"
+    params:
+        ref=ref_fa
+    log:
+        "logs/{sample}_VariantFiltration.log"
+    shell:
+        "(gatk VariantFiltration \
+        -R {params.ref} \
+        -V {input.vcf} \
+        -window 50 \
+        -cluster 3 \
+        --filter-name 'FS' \
+        -filter 'FS > 60.0' \
+        --filter-name 'QD' \
+        -filter 'QD < 2.0' \
+        --filter-name 'SOR' \
+        -filter 'SOR > 3.0' \
+        --filter-name 'MQ' \
+        -filter 'MQ < 40.0' \
+        --filter-name 'MQRankSum' \
+        -filter 'MQRankSum < -12.5' \
+        --filter-name 'MQPosRankSum' \
+        -filter 'MQPosRankSum < -8.0' \
+        -O {output}) 2> {log}"
+
+rule bgzip:
+    input: 
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.vcf"
+    output:
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.vcf.gz"
+    log:
+        "logs/{sample}_bgzip.log"
+    shell:
+        "(bgzip {input}) 2> {log}"
+
+
+rule bcfFiltering:
+    input:
+        vcf=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.vcf.gz"
+    output:
+        WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.QUAL45.DP10.QD7.vcf"
+    params:
+        view="snps",
+        genot="het",
+        filt="PASS"
+    log:
+        "logs/{sample}_bcfFiltering.log"
+    shell:
+        "(bcftools view -v {params.view} \
+        -g {params.genot} \
+        -i 'QUAL>=45 && INFO/DP >=10 && INFO/QD >=7' \
+        -f {params.filt} -O v -o {output} {input.vcf}) 2> {log}"
+
+rule Index_HF:
+    input: WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.QUAL45.DP10.QD7.vcf"
+    output: WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.QUAL45.DP10.QD7.vcf.idx"
+    log: "logs/{sample}_indexHF_annot.log"
+    priority: 8
+    shell:
+        "(gatk IndexFeatureFile \
+            -I {input}) 2> {log}"
+
+rule VariantsToTable:
+    input: 
+        vcf=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.QUAL45.DP10.QD7.vcf",
+        idx=WORKDIR+"/vcf/HardFiltering/{sample}.annotated.hardfiltered.SNP.HET.QUAL45.DP10.QD7.vcf.idx"
+    output:
+        WORKDIR+"/table/{sample}.annotated.hardfiltered.SNP.HET.QUAL45.DP10.QD7.tab"
+    params:
+        table_arg="argt_table"
+    log:
+        "logs/{sample}_VariantsTotable.log"
+    shell:
+        "(gatk VariantsToTable -V {input.vcf} --arguments_file {params.table_arg} -O {output}) \
+        2> {log}"

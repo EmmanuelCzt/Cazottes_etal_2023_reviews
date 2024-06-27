@@ -1,0 +1,331 @@
+##TODO
+#Prepare config file
+#Adapt rull all
+
+#By Emmanuel Cazottes, adapte from Gaël Castel code
+configfile: "config.yaml"
+
+# D165T32, D165T33, D165T34 corrupted files? <- CAUTION about that
+WORKDIR = config["WORKDIR"]
+
+
+rule all:
+    input:
+        #forward=expand(WORKDIR+"/bigwig/{sample}.BPM.forward.bw", sample=config["SAMPLES"]),
+        #reverse=expand(WORKDIR+"/bigwig/{sample}.BPM.reverse.bw", sample=config["SAMPLES"])
+        bam=expand(WORKDIR+"/bam/{sample}/Filtered_bams/{sample}_Filtered.bam",sample=config["SAMPLES"]),
+        bai=expand(WORKDIR+"/bam/{sample}/Filtered_bams/{sample}_Filtered.bam.bai",sample=config["SAMPLES"])
+
+rule trimgalore:
+    #priority:4
+    input:
+        fastq1=WORKDIR+"/fastq/{sample}/{sample}_1.fastq.gz",
+        fastq2=WORKDIR+"/fastq/{sample}/{sample}_2.fastq.gz"
+    params:
+        fastq1_trimmed=WORKDIR+"/fastq/trimmed/{sample}_trimmed_1_val_1.fq.gz",
+        fastq2_trimmed=WORKDIR+"/fastq/trimmed/{sample}_trimmed_2_val_2.fq.gz"
+    output:
+        fastq1_trimmed_renamed=WORKDIR+"/fastq/trimmed/{sample}.trimmed.R1.fastq.gz",
+        fastq2_trimmed_renamed=WORKDIR+"/fastq/trimmed/{sample}.trimmed.R2.fastq.gz"
+    threads: 6
+    shell:"""
+    trim_galore --length 50 --paired -j {threads} -o {WORKDIR}/fastq/trimmed {input.fastq1} {input.fastq2}
+    mv {params.fastq1_trimmed} {output.fastq1_trimmed_renamed}
+    mv {params.fastq2_trimmed} {output.fastq2_trimmed_renamed}
+    """
+# # --length 50 : reads < 50 after trimming are discarded
+# # fait automatiquement le fastqc sur les fastq trimmés ??
+# # conserve les cell barcodes pour le démultiplexage?
+# # Paired-end:
+# # The *_trimmed.fq.gz are produced as intermediate output (as R1 and R2 are trimmed individually in the first instance).
+# # Once the trimming has completed, Trim Galore will launch a round of 'validation' (which is is where the files get the val in their names from),
+# # which primarily performs length-cutoff filtering (and a few more optional things I believe).
+# # Once the validation is complete, the trimmed files will be deleted, and you are left with only the files N1_1_val_1.fq.gz and N1_2_val_2.fq.gz.
+# # Change these names to match format of already trimmed files given by Charbel
+
+###################################FASTQC_TRIMMED#####################################
+
+rule fastqc_trimmed:
+    #priority:3
+    input:
+        fastq_trimmed1=WORKDIR+"/fastq/trimmed/{sample}.trimmed.R1.fastq.gz",
+        fastq_trimmed2=WORKDIR+"/fastq/trimmed/{sample}.trimmed.R2.fastq.gz",
+    output: WORKDIR+"/fastqc/{sample}_fastqc.html"
+    log:
+        out="log/FASTQC_{sample}.out",
+        err="log/FASTQC_{sample}.err"
+    shell:
+        "fastqc -o {output} {input.fastq_trimmed1} {input.fastq_trimmed2} 1> {log.out} 2> {log.err}"
+
+###################################Align reads onto maccaca mulatta reference genome#####################################
+
+rule STAR_rhemac10:
+    input:
+        fw=WORKDIR+"/fastq/trimmed/{sample}.trimmed.R1.fastq.gz",
+        rv=WORKDIR+"/fastq/trimmed/{sample}.trimmed.R2.fastq.gz"
+    output:
+        temp(WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.bam")
+    threads: 16
+    params:
+        index_rhemac10=config["RHEMAC10STAR"],
+        #gtf_rhemac10="genomes/rhemac10/annotation/Macaca_mulatta.Mmul_10.108.UCSC.XICRNA.20221129.gtf",
+        basename=WORKDIR+"/bam/{sample}.rhemac10."
+    log:
+        WORKDIR+"/log/{sample}_star_rhemac10.log"
+    shell:
+        "STAR --readFilesCommand zcat --outFileNamePrefix {params.basename} \
+        --runMode alignReads  --runThreadN {threads} --outFilterType BySJout --outSAMtype BAM SortedByCoordinate \
+        --outSAMattributes NM \
+        --genomeDir {params.index_rhemac10} --readFilesIn  {input.fw} {input.rv}"    
+
+#--outSAMattributes NM Essential for downstream XenofiltR
+
+rule low_mapq:
+    input:
+        bam=WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.bam",
+    output:
+        temp(WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.bam")
+    params: 
+        qual=10
+    #priority: 3
+    log:
+        WORKDIR+"log/{sample}_rhemac10_lowmapq.log"
+    shell:
+        "(samtools view -q {params.qual} -b {input.bam} > {output}) 2> {log}"
+
+rule samtools_index_rhemac10:
+    input: WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.bam"
+    output: temp(WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.bam.bai")
+    log: WORKDIR+"log/{sample}_samtools_index_rhemac10.log"
+    params:
+        "" # optional params string
+    #priority: 3
+    threads: 6
+    shell:
+        "samtools index -b -@ {threads} {input} 2> {log}"
+
+rule MarkDuplicates_rhemac10:
+    input: 
+            bam=WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.bam",
+            bai=WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.bai"
+    output: temp(WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.dedupped.bam")
+    params:
+            CREATE_INDEX="true",
+            VALIDATION_STRINGENCY="SILENT",
+            REMOVE_DUPLICATES="true",
+            ASSUME_SORTED="true",
+            M="output.metrics"
+    log:
+        WORKDIR+"log/{sample}_rhemac10_MarkDuplicates.log"
+    #priority: 6
+    shell:
+        "(picard MarkDuplicates \
+            I={input.bam} \
+            O={output} \
+            CREATE_INDEX={params.CREATE_INDEX} \
+            VALIDATION_STRINGENCY={params.VALIDATION_STRINGENCY} \
+            REMOVE_DUPLICATES={params.REMOVE_DUPLICATES} \
+            ASSUME_SORTED={params.ASSUME_SORTED} \
+            M={params.M}) 2> {log}"
+
+rule samtools_index_rhemac10_md:
+    input: WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.dedupped.bam"
+    output: temp(WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.dedupped.bam.bai")
+    params:
+        "" # optional params string
+    #priority: 3
+    threads: 6
+    log: WORKDIR+"log/{sample}_samtools_index_rhemac10_md.log"
+    shell:
+        "samtools index -b -@ {threads} {input} 2> {log}"
+
+rule stats_rhemac10:
+    input:
+        bam=WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.dedupped.bam",
+        bai=WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.dedupped.bam.bai"
+    output: 
+        WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.dedupped.txt"
+    log: WORKDIR+"log/{sample}_filtered_bam_stat_rhemac10.err"
+    shell:
+        "samtools idxstats {input.bam} > {output} 2> {log}"
+
+###################################Align reads onto mus musculus reference genome#####################################
+
+rule STAR_mm10:
+    input:
+        fw=WORKDIR+"/fastq/trimmed/{sample}.trimmed.R1.fastq.gz",
+        rv=WORKDIR+"/fastq/trimmed/{sample}.trimmed.R2.fastq.gz"
+    output:
+        temp(WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.bam")
+    threads: 16
+    params:
+        index_mm10=config["MM10STAR"],
+        #gtf_mm10="genomes/mm10/annotation/Macaca_mulatta.Mmul_10.108.UCSC.XICRNA.20221129.gtf",
+        basename=WORKDIR+"/bam/{sample}.mm10."
+    log:
+        WORKDIR+"/log/{sample}_star_mm10.log"
+    shell:
+        "STAR --readFilesCommand zcat --outFileNamePrefix {params.basename} \
+        --runMode alignReads  --runThreadN {threads} --outFilterType BySJout --outSAMtype BAM SortedByCoordinate \
+        --outSAMattributes NM \
+        --genomeDir {params.index_mm10} --readFilesIn  {input.fw} {input.rv}"    
+
+#--outSAMattributes NM Essential for downstream XenofiltR
+
+rule low_mapq_mm10:
+    input:
+        bam=WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.bam",
+    output:
+        temp(WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.bam")
+    params: 
+        qual=10
+    #priority: 3
+    log:
+        WORKDIR+"log/{sample}_mm10_lowmapq.log"
+    shell:
+        "(samtools view -q {params.qual} -b {input.bam} > {output}) \
+            2> {log}"
+
+rule samtools_index_mm10:
+    input: WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.bam"
+    output: temp(WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.bam.bai")
+    log: WORKDIR+"log/{sample}_samtools_index_mm10.log"
+    params:
+        "" # optional params string
+    #priority: 3
+    threads: 6
+    shell:
+        "samtools index -b -@ {threads} {input} 2> {log}"
+
+rule MarkDuplicates_mm10:
+    input: 
+            bam=WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.bam",
+            bai=WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.bai"
+    output: temp(WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.dedupped.bam")
+    params:
+            CREATE_INDEX="true",
+            VALIDATION_STRINGENCY="SILENT",
+            REMOVE_DUPLICATES="true",
+            ASSUME_SORTED="true",
+            M="output.metrics"
+    log:
+        WORKDIR+"log/{sample}_mm10_MarkDuplicates.log"
+    #priority: 6
+    shell:
+        "(picard MarkDuplicates \
+            I={input.bam} \
+            O={output} \
+            CREATE_INDEX={params.CREATE_INDEX} \
+            VALIDATION_STRINGENCY={params.VALIDATION_STRINGENCY} \
+            REMOVE_DUPLICATES={params.REMOVE_DUPLICATES} \
+            ASSUME_SORTED={params.ASSUME_SORTED} \
+            M={params.M}) 2> {log}"
+
+rule samtools_index_mm10_md:
+    input: WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.dedupped.bam"
+    output: temp(WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.dedupped.bam.bai")
+    params:
+        "" # optional params string
+    #priority: 3
+    threads: 6
+    log: WORKDIR+"log/{sample}_samtools_index_mm10_md.log"
+    shell:
+        "samtools index -b -@ {threads} {input} 2> {log}"
+
+rule stats_mm10:
+    input:
+        bam=WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.dedupped.bam",
+        bai=WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.dedupped.bam.bai"
+    output: 
+        WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.dedupped.txt"
+    log: WORKDIR+"log/{sample}_filtered_bam_stat_mm10.err"
+    shell:
+        "samtools idxstats {input.bam} > {output} 2> {log}"
+
+###################################XenofiltR#####################################
+
+rule Perform_Xenofilter:
+    input: 
+        mouse_bam=WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.bam",
+        rhesus_bam=WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.bam",
+        mouse_bam_bai=WORKDIR+"/bam/{sample}.mm10.Aligned.sortedByCoord.out.q10.bam.bai",
+        rhesus_bam_bai=WORKDIR+"/bam/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.bam.bai"
+    output:
+        bam=WORKDIR+"/bam/{sample}/Filtered_bams/{sample}_Filtered.bam",
+        bai=WORKDIR+"/bam/{sample}/Filtered_bams/{sample}_Filtered.bam.bai"
+    #params:
+     #   outfolder=WORKDIR+"/bam/"
+    log:WORKDIR+"log/{sample}_xenofilter.log"
+    shell:
+        "(Rscript Xeno.R {input.rhesus_bam} {input.mouse_bam}) 2> {log}"
+
+# {params.outfolder} {output.bam}
+
+rule stats_bam_Xeno:
+    input:
+        bam=WORKDIR+"/bam/{sample}/Filtered_bams/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.dedupped_Filtered.bam",
+        bai=WORKDIR+"/bam/{sample}/Filtered_bams/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.dedupped_Filtered.bam.bai"
+    output: 
+        WORKDIR+"/bam/{sample}/Filtered_bams/{sample}.rhemac10.Aligned.sortedByCoord.out.q10.dedupped.xenofiltRed.txt"
+    log: WORKDIR+"log/{sample}_filtered_bam_stat.err"
+    shell:
+        "samtools idxstats {input.bam} > {output} 2> {log}"
+
+rule bigwig_forward:
+    input:
+        bam=WORKDIR+"/bam/{sample}/Filtered_bams/{sample}_Filtered.bam",
+        bai=WORKDIR+"/bam/{sample}/Filtered_bams/{sample}_Filtered.bam.bai"
+    output: 
+        WORKDIR+"/bigwig/{sample}.BPM.forward.bw"
+    threads: 6
+    params:
+        filterRNAstrand="forward",
+        normalizeUsing="BPM",
+        binSize=20,
+        smoothLength=40,
+    log: "logs/{sample}_BPM_forward.log"
+    shell:
+        "(bamCoverage -b {input.bam} --filterRNAstrand {params.filterRNAstrand} --normalizeUsing {params.normalizeUsing} \
+        --binSize {params.binSize} --smoothLength {params.smoothLength} -p {threads} -o {output}) 2> {log}"
+
+rule bigwig_reverse:
+    input:
+        bam=WORKDIR+"/bam/{sample}/Filtered_bams/{sample}_Filtered.bam",
+        bai=WORKDIR+"/bam/{sample}/Filtered_bams/{sample}_Filtered.bam.bai"
+    output: 
+        WORKDIR+"/bigwig/{sample}.BPM.reverse.bw"
+    threads: 6
+    params:
+        filterRNAstrand="reverse",
+        normalizeUsing="BPM",
+        binSize=20,
+        smoothLength=40,
+    log: "logs/{sample}_BPM_reverse.log"
+    shell:
+        "(bamCoverage -b {input.bam} --filterRNAstrand {params.filterRNAstrand} --normalizeUsing {params.normalizeUsing} \
+        --binSize {params.binSize} --smoothLength {params.smoothLength} -p {threads} -o {output}) 2> {log}"
+
+rule scallop: #Not on cluster
+    input:
+        bam=("map/{sample}_uniq_sorted.bam"),
+        bw=("bigwig/{sample}_BPM_reverse.bw")
+    output:
+        "annotation/{sample}.scallop.gtf"
+    log:
+        "logs/scallop/{sample}.log"
+    params:
+        tx_length=200,
+        flk_length=10,
+        spl_reads=3,
+        gap=25,
+        cov=1,
+        sgl_cov=20
+    shell:
+        "(scallop -i {input.bam} \
+        --min_transcript_length_base {params.tx_length} \
+        --min_flank_length {params.flk_length} \
+        --min_splice_bundary_hits {params.spl_reads} \
+        --min_bundle_gap {params.gap} \
+        --min_transcript_coverage {params.cov} \
+        --min_single_exon_coverage {params.sgl_cov} \
+        -o {output}) 2> {log}"
